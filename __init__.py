@@ -1,3 +1,30 @@
+"""
+OpenAI Prompt Generator for ComfyUI
+
+This module provides a ComfyUI custom node that integrates with OpenAI's API to generate
+creative prompts for image generation. It handles both legacy and modern OpenAI API versions,
+automatically detecting the appropriate parameter format for different model generations.
+
+Key Features:
+- Supports both old (max_tokens) and new (max_completion_tokens) OpenAI API parameters
+- Automatically detects model capabilities and adjusts parameters accordingly
+- Conditionally applies temperature parameter (newer models only support default value)
+- Caches available models and client instances to avoid repeated API calls
+- Handles various API errors gracefully with user-friendly error messages
+- Compatible with OpenAI v1.0.0+ and legacy versions
+
+Architecture:
+- Singleton pattern for model caching to improve performance
+- Model detection logic separated into dedicated methods (_uses_max_completion_tokens, _supports_custom_temperature)
+- API call logic isolated in _generate_prompt_internal for better testability
+- Follows Open/Closed Principle: extensible for new model types without modifying existing code
+
+Interactions:
+- ComfyUI: Registers as a custom node in the "prompt" category
+- OpenAI API: Makes chat completion requests with appropriate parameters based on model version
+- Environment: Reads OPENAI_API_KEY from environment variables
+"""
+
 import os
 import json
 import openai
@@ -126,6 +153,42 @@ class OpenAIPromptGenerator:
         else:
             error_message = "⚠️ Invalid response format"
             return (error_message,)
+    
+    def _uses_max_completion_tokens(self, model: str) -> bool:
+        """
+        Determines if a model uses the new 'max_completion_tokens' parameter.
+        Newer models (gpt-5-mini, o1, o3, etc.) require max_completion_tokens instead of max_tokens.
+        """
+        model_lower = model.lower()
+        
+        # Check for GPT-5 series
+        is_gpt5_series = "gpt-5" in model_lower
+        
+        # Check for o-series models (o1, o3, etc.)
+        is_o_series = model_lower.startswith("o1") or model_lower.startswith("o3")
+        
+        # Newer models use max_completion_tokens
+        should_use_new_param = is_gpt5_series or is_o_series
+        
+        return should_use_new_param
+    
+    def _supports_custom_temperature(self, model: str) -> bool:
+        """
+        Determines if a model supports custom temperature values.
+        Some newer models (o1, o3, gpt-5 series) only support the default temperature of 1.
+        """
+        model_lower = model.lower()
+        
+        # Check for GPT-5 series
+        is_gpt5_series = "gpt-5" in model_lower
+        
+        # Check for o-series models
+        is_o_series = model_lower.startswith("o1") or model_lower.startswith("o3")
+        
+        # These models don't support custom temperature
+        does_not_support_custom = is_gpt5_series or is_o_series
+        
+        return not does_not_support_custom
         
     def _generate_prompt_internal(self, model: str, prompt_context: str, additional_instructions: str, max_tokens: int, temperature: float, seed: int):
         if any(error in model for error in ["Error:", "quota exceeded"]):
@@ -133,18 +196,32 @@ class OpenAIPromptGenerator:
             
         try:
             generated_prompt = ""
+            # Determine model capabilities
+            uses_new_api = self._uses_max_completion_tokens(model)
+            supports_custom_temp = self._supports_custom_temperature(model)
+            
             # For OpenAI v1.0.0+
             if hasattr(self.client, 'chat'):
-                response = self.client.chat.completions.create(
-                    model=model,
-                    messages=[
+                api_params = {
+                    "model": model,
+                    "messages": [
                         {"role": "system", "content": "You are a creative assistant that generates detailed, descriptive prompts for image generation AI. Focus on visual details, style, mood, and composition."},
                         {"role": "user", "content": f"{prompt_context}\n\n{additional_instructions}"}
                     ],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    seed=seed
-                )
+                    "seed": seed
+                }
+                
+                # Add temperature only if model supports it
+                if supports_custom_temp:
+                    api_params["temperature"] = temperature
+                
+                # Use appropriate max tokens parameter based on model
+                if uses_new_api:
+                    api_params["max_completion_tokens"] = max_tokens
+                else:
+                    api_params["max_tokens"] = max_tokens
+                
+                response = self.client.chat.completions.create(**api_params)
                 generated_prompt = response.choices[0].message.content.strip()
                 return (generated_prompt,)
                 
